@@ -2,6 +2,14 @@
 Changelog
 #########
 
+Version 2.0.4
+=============
+
+Bugs Fixed
+----------
+
+- #124: Dependencies usage
+
 Version 2.0.3
 =============
 
