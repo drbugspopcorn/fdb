@@ -30,6 +30,8 @@ import datetime
 import decimal
 import weakref
 import threading
+import inspect
+
 try:
     from builtins import dict
 except ImportError:
@@ -71,7 +73,7 @@ from fdb.ibase import (frb_info_att_charset, isc_dpb_activate_shadow,
                        isc_dpb_sys_user_name_enc, isc_dpb_trace, isc_dpb_user_name,
                        isc_dpb_verify, isc_dpb_version1,
                        isc_dpb_working_directory, isc_dpb_no_db_triggers, isc_dpb_trusted_auth,
-                       isc_dpb_trusted_role, isc_dpb_utf8_filename,
+                       isc_dpb_trusted_role, isc_dpb_utf8_filename, isc_dpb_process_name,
                        isc_dpb_auth_plugin_list, isc_dpb_auth_plugin_name, isc_dpb_specific_auth_data, isc_dpb_nolinger,
                        isc_info_active_tran_count, isc_info_end, isc_info_truncated,
                        isc_info_sql_stmt_type, isc_info_sql_get_plan, isc_info_sql_records,
@@ -731,6 +733,7 @@ def connect(dsn='', user=None, password=None, host=None, port=None, database=Non
         no_db_triggers (int): No database triggers flag (FB 2.1).
         no_linger (int): No linger flag (FB3).
         utf8params (bool): Notify server that database specification and other string parameters are in UTF-8.
+        process_name (str): Process name to be passed to server (FB 2.1).
 
     Returns:
         :class:`Connection`: attached database.
@@ -768,10 +771,17 @@ def connect(dsn='', user=None, password=None, host=None, port=None, database=Non
     """
     def build_dpb(user, password, sql_dialect, role, charset, buffers,
                   force_write, no_reserve, db_key_scope, no_gc,
-                  no_db_triggers, no_linger):
+                  no_db_triggers, no_linger, process_name):
         param_encoding = 'utf8' if utf8params else charset
         dpb = ParameterBuffer(param_encoding)
         dpb.add_parameter_code(isc_dpb_version1)
+        """
+            mapping active connections
+            MON$REMOTE_HOST        │ Client machine hostname (added FB 3.0) │ Not Configurable — resolved from the TCP connection by the server │        
+            MON$REMOTE_PROCESS     │ Client process name │ Configurable - via isc_dpb_process_name (tag 74) │        
+            MON$REMOTE_ADDRESS     │ Client IP address │ Not Configurable │        
+            MON$REMOTE_PID        │ Client process ID │ Configurable - isc_dpb_process_id (tag 71) │
+        """ 
         if user:
             dpb.add_string_parameter(isc_dpb_user_name, user)
         if password:
@@ -798,6 +808,10 @@ def connect(dsn='', user=None, password=None, host=None, port=None, database=Non
             dpb.add_byte_parameter(isc_dpb_no_db_triggers, no_db_triggers)
         if no_linger:
             dpb.add_byte_parameter(isc_dpb_nolinger, no_linger)
+        # process_name sets MON$REMOTE_PROCESS (visible as "App Path" in active connections tools).
+        # MON$REMOTE_HOST ("Computer Name") is resolved by the server from the TCP connection and cannot be set here.
+        if process_name:
+            dpb.add_string_parameter(isc_dpb_process_name, process_name)
         return dpb
 
     load_api(fb_library_name)
@@ -843,9 +857,14 @@ def connect(dsn='', user=None, password=None, host=None, port=None, database=Non
         dsn = b(dsn, _FS_ENCODING)
     if charset:
         charset = charset.upper()
+    if process_name is None:
+        frame = inspect.stack()[1]
+        caller_module = inspect.getmodule(frame[0])
+        module_name = caller_module.__name__ if caller_module else '<unknown>'
+        process_name = '%s.%s' % (module_name, frame[3])
     #
     dpb = build_dpb(user, password, sql_dialect, role, charset, buffers, force_write,
-                    no_reserve, db_key_scope, no_gc, no_db_triggers, no_linger)
+                    no_reserve, db_key_scope, no_gc, no_db_triggers, no_linger, process_name)
     #
     # Pre-attach hook
     #
