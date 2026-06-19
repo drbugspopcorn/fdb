@@ -157,6 +157,10 @@ from fdb.ibase import (frb_info_att_charset, isc_dpb_activate_shadow,
 
 PYTHON_MAJOR_VER = sys.version_info[0]
 
+def _build_alias_comment(alias):
+    safe = alias.replace('*/', '* /').strip()
+    return '/* fdb: %s */ ' % safe
+
 #: Current driver version
 __version__ = '2.0.4'
 
@@ -709,7 +713,8 @@ def connect(dsn='', user=None, password=None, host=None, port=None, database=Non
             force_write=None, no_reserve=None, db_key_scope=None,
             isolation_level=ISOLATION_LEVEL_READ_COMMITED,
             connection_class=None, fb_library_name=None,
-            no_gc=None, no_db_triggers=None, no_linger=None, utf8params=False):
+            no_gc=None, no_db_triggers=None, no_linger=None, utf8params=False,
+            process_name=None):
     """Establish a connection to database.
 
     Keyword Args:
@@ -1838,16 +1843,19 @@ class Connection(object):
         """
         self.__check_attached()
         self._main_transaction.rollback(retaining, savepoint)
-    def cursor(self):
+    def cursor(self, alias=None):
         """Return a new :class:`Cursor` instance using the connection
         associated with :attr:`main_transaction`.
         See :meth:`Transaction.cursor` for details.
+
+        Keyword Args:
+            alias (str): Default alias for SQL comment tagging. See :class:`Cursor`.
 
         Raises:
             fdb.ProgrammingError: If Connection is :attr:`closed`.
         """
         self.__check_attached()
-        return self.main_transaction.cursor()
+        return self.main_transaction.cursor(alias=alias)
     def event_conduit(self, event_names):
         """Creates a conduit through which database event notifications will
         flow into the Python program.
@@ -3544,7 +3552,7 @@ class Cursor(object):
     #: at a time.
     arraysize = 1
 
-    def __init__(self, connection, transaction):
+    def __init__(self, connection, transaction, alias=None):
         """
         .. important::
 
@@ -3555,10 +3563,16 @@ class Cursor(object):
         Args:
             connection (:class:`Connection`):  instance this cursor should be bound to.
             transaction (:class:`Transaction`):  instance this cursor should be bound to.
+
+        Keyword Args:
+            alias (str): Default alias prepended as a SQL comment to every statement
+                executed by this cursor. Visible in MON$STATEMENTS.MON$SQL_TEXT.
+                If None, the calling module+function name is auto-detected per execute().
         """
         self._connection = connection
         self._transaction = transaction
         self._ps = None  # current prepared statement
+        self.alias = alias
     def next(self):
         """Return the next item from the container. Part of *iterator protocol*.
 
@@ -3622,7 +3636,7 @@ class Cursor(object):
     def _set_as_internal(self):
         self._connection = weakref.proxy(self._connection,
                                          _weakref_callback(self.__connection_deleted))
-    def callproc(self, procname, parameters=None):
+    def callproc(self, procname, parameters=None, alias=None):
         """Call a stored database procedure with the given name.
 
         The result of the call is available through the standard fetchXXX() methods.
@@ -3633,6 +3647,8 @@ class Cursor(object):
         Keyword Args:
             parameters (iterable): Sequence of parameters. Must contain one
                            entry for each argument that the procedure expects.
+            alias (str): Per-call alias override for SQL comment tagging. Falls back
+                to cursor-level alias, then auto-detection.
 
         Returns:
             `parameters` as required by Python DB API 2.0 Spec.
@@ -3651,7 +3667,7 @@ class Cursor(object):
                 raise TypeError("callproc paremeters must be List or Tuple")
         sql = ('EXECUTE PROCEDURE ' + procname + ' '
                + ','.join('?' * len(params)))
-        self.execute(sql, params)
+        self.execute(sql, params, alias=alias or self.alias)
         return parameters
     def close(self):
         """Close the cursor now (rather than whenever `__del__` is called).
@@ -3674,7 +3690,7 @@ class Cursor(object):
         if self._ps != None:
             self._ps.close()
             self._ps = None
-    def execute(self, operation, parameters=None):
+    def execute(self, operation, parameters=None, alias=None):
         """Prepare and execute a database operation (query or command).
 
         Note:
@@ -3693,6 +3709,11 @@ class Cursor(object):
         Keyword Args:
             parameters (list or tuple): Sequence of parameters. Must contain one
                 entry for each argument that the operation expects.
+            alias (str): Per-query alias override prepended as ``/* fdb: alias */``
+                to the SQL text. Visible in MON$STATEMENTS.MON$SQL_TEXT. Falls back
+                to the cursor-level :attr:`alias`, then auto-detects the caller's
+                module+function name. Has no effect when `operation` is a
+                pre-compiled :class:`PreparedStatement`.
 
         Raises:
             ValueError: When operation PreparedStatement belongs to different Cursor instance.
@@ -3714,6 +3735,14 @@ class Cursor(object):
                 raise ValueError("PreparedStatement was created by different Cursor.")
             self._ps = weakref.proxy(operation, _weakref_callback(self.__ps_deleted))
         else:
+            if isinstance(operation, StringType):
+                effective_alias = alias or self.alias
+                if effective_alias is None:
+                    frame = inspect.stack()[1]
+                    caller_module = inspect.getmodule(frame[0])
+                    module_name = caller_module.__name__ if caller_module else '<unknown>'
+                    effective_alias = '%s.%s' % (module_name, frame[3])
+                operation = _build_alias_comment(effective_alias) + operation
             self._ps = PreparedStatement(operation, self, True)
         self._ps._execute(parameters)
         # return self so `execute` call could be used as iterable
@@ -3739,7 +3768,7 @@ class Cursor(object):
         if not self._transaction.active:
             self._transaction.begin()
         return PreparedStatement(operation, self, False)
-    def executemany(self, operation, seq_of_parameters):
+    def executemany(self, operation, seq_of_parameters, alias=None):
         """Prepare a database operation (query or command) and then execute it
         against all parameter sequences or mappings found in the sequence
         `seq_of_parameters`.
@@ -3761,6 +3790,9 @@ class Cursor(object):
                 that has one entry for each argument that the
                 operation expects.
 
+        Keyword Args:
+            alias (str): Per-query alias prepended as a SQL comment. See :meth:`execute`.
+
         Raises:
             ValueError: When operation PreparedStatement belongs to different Cursor instance.
             TypeError: When seq_of_parameters is not List or Tuple.
@@ -3768,6 +3800,14 @@ class Cursor(object):
             fdb.DatabaseError: When error is returned by server.
         """
         if not isinstance(operation, PreparedStatement):
+            if isinstance(operation, StringType):
+                effective_alias = alias or self.alias
+                if effective_alias is None:
+                    frame = inspect.stack()[1]
+                    caller_module = inspect.getmodule(frame[0])
+                    module_name = caller_module.__name__ if caller_module else '<unknown>'
+                    effective_alias = '%s.%s' % (module_name, frame[3])
+                operation = _build_alias_comment(effective_alias) + operation
             operation = self.prep(operation)
         for parameters in seq_of_parameters:
             self.execute(operation, parameters)
@@ -4309,7 +4349,7 @@ class Transaction(object):
             name (str): Savepoint name.
         """
         self.execute_immediate('SAVEPOINT %s' % name)
-    def cursor(self, connection=None):
+    def cursor(self, connection=None, alias=None):
         """Creates a new :class:`Cursor` that will operate in the context of this
         Transaction.
 
@@ -4317,6 +4357,7 @@ class Transaction(object):
             connection (:class:`Connection`): **Required only when** Transaction is bound to multiple
                 `Connections`, to specify to which `Connection` the
                 returned Cursor should be bound.
+            alias (str): Default alias for SQL comment tagging. See :class:`Cursor`.
 
         Raises:
             fdb.ProgrammingError: When transaction operates on multiple `Connections`
@@ -4334,7 +4375,7 @@ class Transaction(object):
             con = connection
         else:
             con = self._connections[0]()
-        c = Cursor(con, self)
+        c = Cursor(con, self, alias=alias)
         self._cursors.append(weakref.ref(c, _cursor_weakref_callback(self)))
         return c
     def trans_info(self, request):
